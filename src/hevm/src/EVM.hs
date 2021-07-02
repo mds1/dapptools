@@ -86,6 +86,7 @@ data Error
   | InvalidMemoryAccess
   | CallDepthLimitReached
   | MaxCodeSizeExceeded Word Word
+  | InvalidFormat
   | PrecompileFailure
   | UnexpectedSymbolicArg
   | DeadPath
@@ -195,6 +196,7 @@ data VMOpts = VMOpts
   { vmoptContract :: Contract
   , vmoptCalldata :: (Buffer, SymWord)
   , vmoptValue :: SymWord
+  , vmoptPriorityFee :: W256
   , vmoptAddress :: Addr
   , vmoptCaller :: SAddr
   , vmoptOrigin :: Addr
@@ -207,6 +209,7 @@ data VMOpts = VMOpts
   , vmoptMaxCodeSize :: W256
   , vmoptBlockGaslimit :: W256
   , vmoptGasprice :: W256
+  , vmoptBaseFee :: W256
   , vmoptSchedule :: FeeSchedule Integer
   , vmoptChainId :: W256
   , vmoptCreate :: Bool
@@ -269,6 +272,7 @@ data FrameState = FrameState
 data TxState = TxState
   { _gasprice            :: Word
   , _txgaslimit          :: Word
+  , _txPriorityFee       :: Word
   , _origin              :: Addr
   , _toAddr              :: Addr
   , _value               :: SymWord
@@ -377,6 +381,7 @@ data Block = Block
   , _number      :: Word
   , _difficulty  :: Word
   , _gaslimit    :: Word
+  , _baseFee     :: Word
   , _maxCodeSize :: Word
   , _schedule    :: FeeSchedule Integer
   } deriving Show
@@ -460,6 +465,7 @@ makeVm o =
   , _tx = TxState
     { _gasprice = w256 $ vmoptGasprice o
     , _txgaslimit = w256 $ vmoptGaslimit o
+    , _txPriorityFee = w256 $ vmoptPriorityFee o
     , _origin = txorigin
     , _toAddr = txtoAddr
     , _value = vmoptValue o
@@ -478,6 +484,7 @@ makeVm o =
     , _difficulty = w256 $ vmoptDifficulty o
     , _maxCodeSize = w256 $ vmoptMaxCodeSize o
     , _gaslimit = w256 $ vmoptBlockGaslimit o
+    , _baseFee = w256 $ vmoptBaseFee o
     , _schedule = vmoptSchedule o
     }
   , _state = FrameState
@@ -963,6 +970,11 @@ exec1 = do
           limitStack 1 . burn g_low $
             next >> push (view balance this)
 
+        -- op: BASEFEE
+        0x48 ->
+          limitStack 1 . burn g_base $
+            next >> push (the block baseFee)
+
         -- op: POP
         0x50 ->
           case stk of
@@ -1052,12 +1064,12 @@ exec1 = do
                             unless (current' == new') $
                               if current' == original
                               then when (original /= 0 && new' == 0) $
-                                      refund r_sclear
+                                      refund (g_sreset + g_access_list_storage_key)
                               else do
                                       when (original /= 0) $
                                         if new' == 0
-                                        then refund r_sclear
-                                        else unRefund r_sclear
+                                        then refund (g_sreset + g_access_list_storage_key)
+                                        else unRefund (g_sreset + g_access_list_storage_key)
                                       when (original == new') $
                                         if original == 0
                                         then refund (g_sset - g_sload)
@@ -1198,31 +1210,24 @@ exec1 = do
                   output = readMemory xOffset xSize vm
                   codesize = num (len output)
                   maxsize = the block maxCodeSize
-                case view frames vm of
-                  [] ->
-                    case (the tx isCreate) of
-                      True ->
-                        if codesize > maxsize
-                        then
-                          finishFrame (FrameErrored (MaxCodeSizeExceeded maxsize codesize))
-                        else
-                          burn (g_codedeposit * num codesize) $
-                            finishFrame (FrameReturned output)
-                      False ->
+                  creation = case view frames vm of
+                    [] -> the tx isCreate
+                    frame:_ -> case view frameContext frame of
+                       CreationContext {} -> True
+                       CallContext {} -> False
+                if creation
+                then
+                  if codesize > maxsize
+                  then
+                    finishFrame (FrameErrored (MaxCodeSizeExceeded maxsize codesize))
+                  else
+                    if isConcretely (readByteOrZero 0 output) ((==) 0xef)
+                    then finishFrame $ FrameErrored InvalidFormat
+                    else do
+                      burn (g_codedeposit * num codesize) $
                         finishFrame (FrameReturned output)
-                  (frame: _) -> do
-                    let
-                      context = view frameContext frame
-                    case context of
-                      CreationContext {} ->
-                        if codesize > maxsize
-                        then
-                          finishFrame (FrameErrored (MaxCodeSizeExceeded maxsize codesize))
-                        else
-                          burn (g_codedeposit * num codesize) $
-                            finishFrame (FrameReturned output)
-                      CallContext {} ->
-                          finishFrame (FrameReturned output)
+                else
+                   finishFrame (FrameReturned output)
             _ -> underrun
 
         -- op: DELEGATECALL
@@ -1299,8 +1304,6 @@ exec1 = do
                           then num g_selfdestruct_newaccount
                           else 0
               burn (g_selfdestruct + c_new + cost) $ do
-                   destructs <- use (tx . substate . selfdestructs)
-                   unless (elem self destructs) $ refund r_selfdestruct
                    selfdestruct self
                    touchAccount xTo
 
@@ -1750,14 +1753,16 @@ finalize = do
   miner        <- use (block . coinbase)
   blockReward  <- num . r_block <$> (use (block . schedule))
   gasPrice     <- use (tx . gasprice)
+  priorityFee  <- use (tx . txPriorityFee)
   gasLimit     <- use (tx . txgaslimit)
   gasRemaining <- use (state . gas)
 
   let
     gasUsed      = gasLimit - gasRemaining
-    cappedRefund = min (quot gasUsed 2) (num sumRefunds)
+    cappedRefund = min (quot gasUsed 5) (num sumRefunds)
     originPay    = (gasRemaining + cappedRefund) * gasPrice
-    minerPay     = gasPrice * (gasUsed - cappedRefund)
+
+    minerPay     = priorityFee * gasUsed
 
   modifying (env . contracts)
      (Map.adjust (over balance (+ originPay)) txOrigin)
